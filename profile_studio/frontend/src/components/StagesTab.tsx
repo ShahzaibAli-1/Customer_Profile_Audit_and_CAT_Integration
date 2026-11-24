@@ -9,27 +9,38 @@ function coopTone(c?: string) {
   return c === "high" ? "green" : c === "medium" ? "amber" : c === "low" ? "red" : "gray";
 }
 
-function CallAnalysis({ c, onShow }: { c: Json; onShow: () => void }) {
+function auditOf(s: Json) {
+  const inc = (s.audits || []).filter((a: Json) => a.included !== false);
+  return (inc.length ? inc : s.audits || [])[0];
+}
+
+function StageAnalysis({ c, onShow }: { c: Json; onShow: () => void }) {
   const a = c.analysis;
   const cust = a?.customer || {};
   const adv = a?.advisor || {};
+  const audits: Json[] = c.audits || [];
+  const reasoning = audits.map((x: Json) => x.reasoning && `[Call ${x.call_id}${x.included === false ? " – duplicate recording" : ""}]\n${x.reasoning}`).filter(Boolean).join("\n\n");
   return (
     <div className="card overflow-hidden">
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5 bg-slate-50 border-b border-slate-200">
-        <span className="font-mono text-sm">Call {c.call_id}</span>
-        {c.time?.length ? <Badge tone="indigo">{c.time.join(", ")}</Badge> : <Badge>not found in transcript</Badge>}
-        {c.audit_status && <StatusBadge status={`Audit: ${c.audit_status}`} />}
-        {c.audit_score && c.audit_score[1] ? <Badge>{c.audit_score[0]}/{c.audit_score[1]}</Badge> : null}
+        {c.time?.length ? c.time.map((t: string, i: number) => <Badge key={i} tone="indigo">{t}</Badge>) : <Badge>not found in the conversation</Badge>}
+        {audits.map((x: Json) => (
+          <span key={x.call_id} className={x.included === false ? "opacity-60" : ""} title={x.included === false ? "Audit of a duplicate recording" : `Audit of call ${x.call_id}`}>
+            <StatusBadge status={`${audits.length > 1 ? `Call ${x.call_id} audit` : "Audit"}: ${x.status}`} />
+            {x.max_score ? <span className="ml-1"><Badge>{x.score}/{x.max_score}</Badge></span> : null}
+          </span>
+        ))}
         {c.segment_note && <span className="text-xs text-slate-500">{c.segment_note}</span>}
-        {c.covered && (
+        {c.covered && !c.legacy && (
           <button className="ml-auto btn-ghost text-xs" onClick={onShow}>
             <PlayCircle className="h-3.5 w-3.5" /> Show in transcript
           </button>
         )}
       </div>
+      {c.legacy && <div className="px-4 py-2 text-xs text-amber-700 bg-amber-50">Built before calls were merged into one conversation – use “Rebuild everything” to update.</div>}
       {c.error && <div className="px-4 py-2 text-sm text-rose-600">Analysis failed: {c.error}</div>}
       {!a && !c.error && (
-        <div className="px-4 py-3 text-sm text-slate-500">{c.covered ? "No analysis." : "This stage wasn't found in this call's transcript."}</div>
+        <div className="px-4 py-3 text-sm text-slate-500">{c.covered ? "No analysis." : "This stage wasn't found anywhere in the conversation."}</div>
       )}
       {a && (
         <div className="p-4 space-y-4">
@@ -87,10 +98,10 @@ function CallAnalysis({ c, onShow }: { c: Json; onShow: () => void }) {
               <div className="text-sm text-indigo-950">{a.simulation_guidance}</div>
             </div>
           )}
-          {c.audit_reasoning && (
+          {reasoning && (
             <details className="text-sm">
               <summary className="cursor-pointer text-slate-500">Auditor's reasoning</summary>
-              <pre className="mt-2 whitespace-pre-wrap text-xs text-slate-600 bg-slate-50 rounded-lg p-3">{c.audit_reasoning}</pre>
+              <pre className="mt-2 whitespace-pre-wrap text-xs text-slate-600 bg-slate-50 rounded-lg p-3">{reasoning}</pre>
             </details>
           )}
         </div>
@@ -102,6 +113,7 @@ function CallAnalysis({ c, onShow }: { c: Json; onShow: () => void }) {
 export default function StagesTab({ profile, calls, onBuild, building, onShowTranscript }: {
   profile: Json; calls: Json[]; onBuild: () => void; building: boolean; onShowTranscript: (callId: number, stage: number) => void;
 }) {
+  const conversation: Json[] = profile?.meta?.conversation || [];
   const stages: Json[] = profile?.stages || [];
   const [selected, setSelected] = useState<number>(1);
   const behaviour = useMemo(() => {
@@ -135,8 +147,8 @@ export default function StagesTab({ profile, calls, onBuild, building, onShowTra
           <div key={g} className="mb-2">
             <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">{g}</div>
             {stages.filter((s) => s.group === g).map((s) => {
-              const covered = s.calls.some((c: Json) => c.covered);
-              const audit = s.calls.find((c: Json) => c.audit_status)?.audit_status;
+              const covered = Boolean(s.covered);
+              const audit = auditOf(s)?.status;
               const tone = statusTone(audit);
               const dot = !covered ? "bg-slate-300" : tone === "green" ? "bg-emerald-500" : tone === "amber" ? "bg-amber-400" : tone === "red" ? "bg-rose-500" : "bg-sky-400";
               return (
@@ -174,11 +186,14 @@ export default function StagesTab({ profile, calls, onBuild, building, onShowTra
             )}
           </div>
         )}
-        {stage.calls.length ? (
-          stage.calls.map((c: Json) => <CallAnalysis key={c.call_id} c={c} onShow={() => onShowTranscript(c.call_id, stage.n)} />)
-        ) : (
-          <div className="card"><Empty title="This stage didn't happen in any call" /></div>
+        {conversation.length > 1 && (
+          <div className="text-xs text-slate-500">
+            Analysed across the whole conversation:{" "}
+            {conversation.filter((c) => c.included).map((c) => `call ${c.call_no} = ${c.call_id}`).join(", ")}
+            {conversation.some((c) => !c.included) && <> · {conversation.filter((c) => !c.included).map((c) => `${c.call_id} skipped (duplicate of ${c.contained_in})`).join(", ")}</>}
+          </div>
         )}
+        <StageAnalysis c={stage} onShow={() => onShowTranscript(0, stage.n)} />
       </div>
     </div>
   );

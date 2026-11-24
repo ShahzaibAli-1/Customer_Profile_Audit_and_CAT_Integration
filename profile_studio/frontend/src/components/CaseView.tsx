@@ -140,7 +140,7 @@ export default function CaseView({ refId, tab, refreshKey, jobs, onJobStarted, h
             </button>
             {pstatus === "ready" && profile?.stages && (
               <button className="btn-secondary" onClick={() => build(undefined, true)} disabled={busy || activeJobs.length > 0}
-                title="Keep the stage analysis and regenerate only the customer profile (about 2 minutes)">
+                title="Keep the stage analysis and regenerate the in-depth profile and persona (about 4-6 minutes)">
                 <Sparkles className="h-4 w-4" /> Rebuild profile only
               </button>
             )}
@@ -228,6 +228,22 @@ function Overview({ detail, profile, goTab }: { detail: Json; profile: Json; goT
             </tbody>
           </table>
           {!calls.length && <Empty title="No calls fetched" />}
+          {(profile?.meta?.conversation || []).length > 1 && (
+            <div className="border-t border-slate-200 px-4 py-3 text-sm space-y-1 bg-slate-50/60">
+              <div className="font-medium">How the calls were combined</div>
+              {(profile.meta.conversation as Json[]).map((c) => (
+                <div key={c.call_id} className="flex items-start gap-2">
+                  {c.included ? <Badge tone="green">Call {c.call_no}</Badge> : <Badge>Skipped</Badge>}
+                  <span className="font-mono">{c.call_id}</span>
+                  <span className="text-slate-600">
+                    {c.included
+                      ? `${c.lines} lines · ${c.opening}`
+                      : `same conversation as call ${c.contained_in} (${Math.round((c.containment || 0) * 100)}% of its lines appear there, ${c.span_in_kept}) – not added twice`}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="card p-4">
@@ -238,8 +254,8 @@ function Overview({ detail, profile, goTab }: { detail: Json; profile: Json; goT
           {stages.length ? (
             <div className="grid grid-cols-4 sm:grid-cols-8 gap-1.5">
               {stages.map((s) => {
-                const covered = s.calls.some((c: Json) => c.covered);
-                const audit = s.calls.find((c: Json) => c.audit_status)?.audit_status;
+                const covered = Boolean(s.covered);
+                const audit = ((s.audits || []).find((a: Json) => a.included !== false) || (s.audits || [])[0])?.status;
                 const tone = statusTone(audit);
                 const color = !covered ? "bg-slate-100 text-slate-400" : tone === "green" ? "bg-emerald-100 text-emerald-800" : tone === "amber" ? "bg-amber-100 text-amber-800" : tone === "red" ? "bg-rose-100 text-rose-800" : "bg-sky-100 text-sky-800";
                 return (

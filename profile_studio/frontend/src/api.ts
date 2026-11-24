@@ -33,6 +33,7 @@ export const api = {
   documents: (ref: string) => req("GET", `/api/cases/${ref}/documents`),
   docUrl: (ref: string, path: string, download = false) =>
     `/api/cases/${ref}/documents/file?path=${encodeURIComponent(path)}${download ? "&download=true" : ""}`,
+  conversation: (ref: string) => req("GET", `/api/cases/${ref}/conversation`),
   transcript: (ref: string, callId: number) => req("GET", `/api/cases/${ref}/calls/${callId}/transcript`),
   audit: (ref: string, callId: number) => req("GET", `/api/cases/${ref}/calls/${callId}/audit`),
   profile: (ref: string) => req("GET", `/api/cases/${ref}/profile`),

@@ -207,11 +207,58 @@ def case_cat(ref: str):
     return data
 
 
+def _stage_tags(conv: dict) -> dict[int, list[int]]:
+    tag: dict[int, list[int]] = defaultdict(list)
+    for n, st in (conv.get("stages") or {}).items():
+        for a, b in st.get("spans") or []:
+            for i in range(a, b + 1):
+                tag[i].append(int(n))
+    return tag
+
+
+def _non_customer(conv: dict) -> set[int]:
+    nc = set()
+    for sp in conv.get("non_customer_spans") or []:
+        nc.update(range(sp.get("start", 0), sp.get("end", -1) + 1))
+    return nc
+
+
+@app.get("/api/cases/{ref}/conversation")
+def conversation(ref: str):
+    """All of a case's calls merged into one ordered conversation (duplicates removed), with stage tags."""
+    conv = store.read_json(store.profile_dir(store.clean_ref(ref)) / "conversation.json", None)
+    if not conv:
+        return {"available": False}
+    tag, nc = _stage_tags(conv), _non_customer(conv)
+    lines = [{**{k: ln[k] for k in ("i", "call_id", "call_no", "t", "start", "speaker", "role", "text")},
+              "stages": sorted(tag.get(ln["i"], [])), "non_customer": ln["i"] in nc} for ln in conv["lines"]]
+    return {"available": True, "segmented": bool(conv.get("stages")), "calls": conv["calls"],
+            "multi_call": conv.get("multi_call"), "non_customer_spans": conv.get("non_customer_spans") or [],
+            "lines": lines}
+
+
 @app.get("/api/cases/{ref}/calls/{call_id}/transcript")
 def transcript(ref: str, call_id: int):
     ref = store.clean_ref(ref)
+    conv = store.read_json(store.profile_dir(ref) / "conversation.json", None)
+    if conv:
+        cmeta = next((c for c in conv["calls"] if c["call_id"] == call_id), None)
+        if cmeta and cmeta.get("included"):
+            tag, nc = _stage_tags(conv), _non_customer(conv)
+            lines = [{"i": ln["li"], "t": clock(ln["start"]), "start": ln["start"], "speaker": ln["speaker"],
+                      "role": ln["role"], "text": ln["text"], "stages": sorted(tag.get(ln["i"], [])),
+                      "non_customer": ln["i"] in nc} for ln in conv["lines"] if ln["call_id"] == call_id]
+            return {"call_id": call_id, "roles": cmeta.get("roles") or {}, "roles_how": cmeta.get("roles_how"),
+                    "segmented": bool(conv.get("stages")), "note": None, "lines": lines}
+    note = None
+    if conv:
+        cmeta = next((c for c in conv["calls"] if c["call_id"] == call_id), None)
+        if cmeta and not cmeta.get("included"):
+            note = (f"This recording is the same conversation as call {cmeta.get('contained_in')} "
+                    f"({round((cmeta.get('containment') or 0) * 100)}% of its lines are there, at "
+                    f"{cmeta.get('span_in_kept')}), so it isn't added to the conversation a second time.")
     seg = store.read_json(store.profile_dir(ref) / "calls" / f"{call_id}.json", None)
-    if seg:
+    if seg and not conv:
         lines, roles = seg["lines"], seg["roles"]
         stage_spans = {int(k): v.get("spans") or [] for k, v in seg["stages"].items()}
         non_customer = seg.get("non_customer_spans") or []
@@ -234,8 +281,8 @@ def transcript(ref: str, call_id: int):
     out = [{"i": ln["i"], "t": clock(ln["start"]), "start": ln["start"], "speaker": ln["speaker"],
             "role": roles.get(ln["speaker"], f"SPEAKER_{ln['speaker']}"), "text": ln["text"],
             "stages": sorted(tag.get(ln["i"], [])), "non_customer": ln["i"] in nc} for ln in lines]
-    return {"call_id": call_id, "roles": roles, "roles_how": roles_how, "segmented": bool(seg),
-            "non_customer_spans": non_customer, "lines": out}
+    return {"call_id": call_id, "roles": roles, "roles_how": roles_how, "segmented": bool(seg and not conv),
+            "non_customer_spans": non_customer, "note": note, "lines": out}
 
 
 @app.get("/api/cases/{ref}/calls/{call_id}/audit")
@@ -262,14 +309,46 @@ def audit(ref: str, call_id: int):
 
 
 # ------------------------------------------------------------------- profile
+def _upgrade_stage(s: dict) -> dict:
+    """Old per-call stage entry -> merged-conversation shape (so older profiles still display)."""
+    calls = s.get("calls") or []
+    best = max(calls, key=lambda c: (bool(c.get("analysis")), len(c.get("spans") or [])), default={})
+    return {
+        "n": s["n"], "key": s.get("key"), "name": s["name"], "group": s["group"],
+        "covered": any(c.get("covered") for c in calls), "spans": [],
+        "time": [f"call {c['call_id']} {t}" for c in calls for t in c.get("time") or []],
+        "segment_note": best.get("segment_note"),
+        "audits": [{"call_id": c["call_id"], "included": True, "status": c.get("audit_status"),
+                    "score": (c.get("audit_score") or [None, None])[0],
+                    "max_score": (c.get("audit_score") or [None, None])[1], "question": c.get("audit_question"),
+                    "reasoning": c.get("audit_reasoning"), "sub_questions": c.get("audit_sub_questions")}
+                   for c in calls if c.get("audit_status")],
+        "analysis": best.get("analysis"), "error": best.get("error"), "legacy": True,
+    }
+
+
 @app.get("/api/cases/{ref}/profile")
 def profile(ref: str):
     ref = store.clean_ref(ref)
     pdir = store.profile_dir(ref)
+    stages = store.read_json(pdir / "stages.json", None)
+    if isinstance(stages, list) and stages and "calls" in stages[0]:
+        stages = [_upgrade_stage(s) for s in stages]       # profile built before calls were merged
     return {"meta": store.read_json(pdir / "meta.json", {"status": "none"}),
-            "stages": store.read_json(pdir / "stages.json", None),
+            "deep": store.read_json(pdir / "deep_profile.json", None),
+            "report_available": (pdir / "customer_profile.md").exists(),
+            "stages": stages,
             "persona": store.read_json(pdir / "persona.json", None),
             "persona_full": store.read_json(pdir / "persona_full.json", None)}
+
+
+@app.get("/api/cases/{ref}/report.md")
+def profile_report(ref: str):
+    ref = store.clean_ref(ref)
+    f = store.profile_dir(ref) / "customer_profile.md"
+    if not f.exists():
+        raise HTTPException(404, "Build the profile first")
+    return FileResponse(f, media_type="text/markdown", filename=f"customer_profile_{ref}.md")
 
 
 @app.put("/api/cases/{ref}/persona")

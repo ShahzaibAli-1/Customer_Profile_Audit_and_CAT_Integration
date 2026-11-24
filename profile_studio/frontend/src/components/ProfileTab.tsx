@@ -1,9 +1,15 @@
-import { Check, Copy, Download, Pencil, Save, Send, Sparkles, X } from "lucide-react";
+import { Check, Copy, Download, FileText, Pencil, Save, Send, Sparkles, X } from "lucide-react";
+import DeepProfile from "./DeepProfile";
 import { useEffect, useState } from "react";
 import { api, Json } from "../api";
 import { Badge, Empty, ErrorBox, KV, List, Spinner } from "./ui";
 
 const GROUPS: [string, string[]][] = [
+  ["Who they are", ["backstory", "personality_traits", "key_people"]],
+  ["How they talk", ["communication_style", "speech_patterns", "signature_phrases"]],
+  ["Emotions", ["emotional_triggers", "coping_style", "stress_signals"]],
+  ["Thinking & deciding", ["understanding_level", "decision_style", "solution_preferences"]],
+  ["Motivation", ["attitude_to_debt", "goals", "fears", "red_lines", "trust_builders", "trust_breakers"]],
   ["Identity", ["name", "gender", "date_of_birth", "address_line", "postcode", "email"]],
   ["Personality & mood", ["mood", "personality", "biggest_concern", "daily_impact"]],
   ["Debt story", ["debt_cause", "trigger_point", "duration", "previous_solutions", "temporary_payment_plan_details", "tried_so_far", "collection_activity"]],
@@ -27,6 +33,7 @@ export default function ProfileTab({ refId, profile, onSaved, onBuild, building 
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [view, setView] = useState<"deep" | "persona" | "guide">("deep");
 
   useEffect(() => {
     if (persona) setDraft(JSON.stringify(persona, null, 2));
@@ -111,6 +118,11 @@ export default function ProfileTab({ refId, profile, onSaved, onBuild, building 
             <a className="btn-secondary" href={`data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(persona, null, 2))}`} download={`${persona.id}.json`}>
               <Download className="h-4 w-4" /> JSON
             </a>
+            {profile.report_available && (
+              <a className="btn-secondary" href={`/api/cases/${refId}/report.md`} download>
+                <FileText className="h-4 w-4" /> Profile report
+              </a>
+            )}
             <button className="btn-secondary" onClick={copy}>{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />} Copy</button>
             <button className="btn-secondary" onClick={() => setEditing(!editing)}>{editing ? <X className="h-4 w-4" /> : <Pencil className="h-4 w-4" />} {editing ? "Close editor" : "Edit"}</button>
           </div>
@@ -129,7 +141,15 @@ export default function ProfileTab({ refId, profile, onSaved, onBuild, building 
         </div>
       )}
 
-      {full.overall && (
+      <div className="flex gap-1 border-b border-slate-200">
+        {([["deep", "In-depth profile"], ["persona", "Agent persona fields"], ["guide", "Behaviour guide"]] as const).map(([k, l]) => (
+          <button key={k} className={`tab ${view === k ? "tab-active" : ""}`} onClick={() => setView(k)}>{l}</button>
+        ))}
+      </div>
+
+      {view === "deep" && <DeepProfile deep={profile.deep} />}
+
+      {view === "persona" && full.overall && (
         <div className="card p-5 grid md:grid-cols-2 gap-4">
           <KV k="Personality" v={full.overall.personality_summary} />
           <KV k="Communication style" v={full.overall.communication_style} />
@@ -142,8 +162,8 @@ export default function ProfileTab({ refId, profile, onSaved, onBuild, building 
         </div>
       )}
 
-      <div className="grid lg:grid-cols-2 gap-5">
-        {GROUPS.map(([title, keys]) => (
+      {view === "persona" && <div className="grid lg:grid-cols-2 gap-5">
+        {GROUPS.filter(([, keys]) => keys.some((k) => p[k] !== undefined && p[k] !== "")).map(([title, keys]) => (
           <div key={title} className="card p-4">
             <div className="font-semibold mb-3">{title}</div>
             <div className="space-y-2.5">
@@ -167,12 +187,12 @@ export default function ProfileTab({ refId, profile, onSaved, onBuild, building 
             </div>
           ) : <div className="text-sm text-slate-400">None listed – the agent works these out from the creditors.</div>}
         </div>
-      </div>
+      </div>}
 
-      <div className="card p-5">
+      {view === "guide" && <div className="card p-5">
         <div className="font-semibold mb-2">Behaviour guide (sent to the AI Call Agent)</div>
         <pre className="whitespace-pre-wrap text-sm text-slate-700 font-sans leading-relaxed">{p.behavior_guide}</pre>
-      </div>
+      </div>}
     </div>
   );
 }

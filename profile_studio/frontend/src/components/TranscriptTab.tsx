@@ -10,7 +10,9 @@ function highlight(text: string, q: string) {
 }
 
 export default function TranscriptTab({ refId, calls, focus }: { refId: string; calls: Json[]; focus: { callId: number; stage: number } | null }) {
-  const [callId, setCallId] = useState<number | null>(focus?.callId ?? calls[calls.length - 1]?.call_id ?? null);
+  // 0 = the whole conversation (all calls merged in order, duplicates removed)
+  const [callId, setCallId] = useState<number | null>(focus?.callId ?? 0);
+  const [convAvailable, setConvAvailable] = useState<boolean | null>(null);
   const [data, setData] = useState<Json>(null);
   const [stages, setStages] = useState<Json[]>([]);
   const [stage, setStage] = useState<number>(focus?.stage ?? 0);
@@ -31,7 +33,17 @@ export default function TranscriptTab({ refId, calls, focus }: { refId: string; 
   useEffect(() => {
     if (callId == null) return;
     setLoading(true);
-    api.transcript(refId, callId).then((d) => { setData(d); setError(null); }).catch((e) => setError(e.message)).finally(() => setLoading(false));
+    const load = callId === 0
+      ? api.conversation(refId).then((d) => {
+          setConvAvailable(Boolean(d.available));
+          if (!d.available) {
+            setCallId(calls[calls.length - 1]?.call_id ?? null);
+            return null;
+          }
+          return { ...d, roles: {}, roles_how: "" };
+        })
+      : api.transcript(refId, callId);
+    load.then((d) => { if (d) { setData(d); setError(null); } }).catch((e) => setError(e.message)).finally(() => setLoading(false));
   }, [refId, callId]);
 
   const lines: Json[] = useMemo(() => {
@@ -49,13 +61,15 @@ export default function TranscriptTab({ refId, calls, focus }: { refId: string; 
   if (!calls.length) return <div className="card"><Empty title="No calls fetched" /></div>;
 
   let lastStageKey = "";
+  let lastCall: number | null = null;
   return (
     <div className="space-y-3">
       <div className="card p-3 flex flex-wrap items-end gap-3 sticky top-0 z-10">
         <div>
           <label className="label">Call</label>
           <select className="input" value={callId ?? ""} onChange={(e) => setCallId(Number(e.target.value))}>
-            {calls.map((c) => <option key={c.call_id} value={c.call_id}>{c.call_id} · {fmtDate(c.call_date)}</option>)}
+            {convAvailable !== false && <option value={0}>Whole conversation{calls.length > 1 ? " (all calls, in order)" : ""}</option>}
+            {calls.map((c) => <option key={c.call_id} value={c.call_id}>Call {c.call_id} · {fmtDate(c.call_date)}{c.case_id?.endsWith("-W") ? " (-W)" : ""}</option>)}
           </select>
         </div>
         <div>
@@ -74,11 +88,25 @@ export default function TranscriptTab({ refId, calls, focus }: { refId: string; 
         </div>
         <div className="text-xs text-slate-500 pb-2">
           {lines.length} lines
-          {data && <> · speakers: {Object.entries(data.roles || {}).map(([k, v]) => `${k}=${v}`).join(", ") || "unknown"}</>}
+          {data && callId !== 0 && <> · speakers: {Object.entries(data.roles || {}).map(([k, v]) => `${k}=${v}`).join(", ") || "unknown"}</>}
         </div>
       </div>
+      {callId === 0 && data?.calls && data.calls.length > 1 && (
+        <div className="card p-3 text-sm space-y-1">
+          {data.calls.map((c: Json) => (
+            <div key={c.call_id} className="flex gap-2 items-center">
+              {c.included ? <Badge tone="green">Call {c.call_no}</Badge> : <Badge>Skipped</Badge>}
+              <span className="font-mono">{c.call_id}</span>
+              <span className="text-slate-600">
+                {c.included ? `lines ${c.first_line}–${c.last_line} · ${c.opening}` : `duplicate recording of call ${c.contained_in} (${Math.round((c.containment || 0) * 100)}% overlap) – not repeated`}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {data?.note && <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">{data.note}</div>}
       {data && !data.segmented && (
-        <div className="text-xs text-slate-500">Stage markers appear after the profile is built. Speaker roles here come from the audit evidence ({data.roles_how}).</div>
+        <div className="text-xs text-slate-500">Stage markers appear after the profile is built.{data.roles_how ? ` Speaker roles here come from the audit evidence (${data.roles_how}).` : ""}</div>
       )}
       <ErrorBox error={error} />
       {loading && <div className="p-8 grid place-items-center"><Spinner /></div>}
@@ -89,8 +117,17 @@ export default function TranscriptTab({ refId, calls, focus }: { refId: string; 
           const key = l.stages.join(",");
           const showMarker = data?.segmented && key && key !== lastStageKey && !stage;
           lastStageKey = key || lastStageKey;
+          const callBreak = callId === 0 && data?.multi_call && l.call_no !== lastCall;
+          lastCall = l.call_no ?? lastCall;
           return (
             <Fragment key={l.i}>
+              {callBreak && (
+                <div className="flex items-center gap-2 pt-4 pb-1">
+                  <div className="h-px flex-1 bg-emerald-200" />
+                  <Badge tone="green">Call {l.call_no} · {l.call_id}</Badge>
+                  <div className="h-px flex-1 bg-emerald-200" />
+                </div>
+              )}
               {showMarker && (
                 <div className="flex items-center gap-2 pt-3 pb-1">
                   <div className="h-px flex-1 bg-indigo-100" />

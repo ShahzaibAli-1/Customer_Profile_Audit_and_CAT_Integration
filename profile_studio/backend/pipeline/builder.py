@@ -22,6 +22,8 @@ from typing import Callable
 
 import store
 from . import llm
+from .conversation import build_conversation, render_conversation
+from .deep_profile import build_deep_profile, compact_for_persona, report_markdown
 from .stages import STAGE_BY_N, STAGES, stage_list_text
 from .transcript import (ADVISOR, CUSTOMER, audit_by_stage, build_lines, clock, crm_checks,
                          guess_roles, lines_in_seconds, render)
@@ -40,6 +42,14 @@ PROFILE_FIELDS = [
     "loan_position", "loan_decline_reason", "collection_activity", "additional_debt_checks",
     "recent_account_spending", "preferential_payments", "additional_debts",
     "consent_to_recording", "consent_to_note_vulnerability", "behavior_guide",
+]
+# Descriptive fields beyond the agent's CustomerProfile dataclass. The agent's loader keeps unknown keys
+# as extra_facts and puts them in the prompt, so they shape the simulated customer too.
+EXTRA_PROFILE_FIELDS = [
+    "backstory", "personality_traits", "communication_style", "speech_patterns", "signature_phrases",
+    "emotional_triggers", "coping_style", "stress_signals", "understanding_level", "decision_style",
+    "attitude_to_debt", "goals", "fears", "red_lines", "trust_builders", "trust_breakers",
+    "solution_preferences", "key_people",
 ]
 ADDITIONAL_DEBT_KEYS = ["overdraft", "hmrc", "council_tax", "dwp", "vat", "parking_fines", "court_fines",
                         "family_friends", "previous_rent_arrears", "current_rent_arrears", "student_loans",
@@ -65,74 +75,102 @@ def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-") or "customer"
 
 
+# ======================================================================= step 0
+ROLE_SYSTEM = "You identify speakers in UK debt-advice call transcripts. Answer with JSON only."
+
+
+def resolve_roles(lines, model, usage) -> tuple[dict, str]:
+    """Which speaker letter is the advisor, when the audit evidence could not tell."""
+    sample = render(lines[:160])
+    data = llm.chat_json(model, ROLE_SYSTEM,
+                         "This is the start of a call between a debt ADVISOR and a CUSTOMER (calls may open with "
+                         "a short lead hand-over by another agent). Which speaker letter is the ADVISOR?\n"
+                         'Return {"advisor_speaker": "A" or "B", "reason": "one sentence"}\n\n' + sample,
+                         usage, effort="low")
+    adv = str(data.get("advisor_speaker") or "").strip().upper()[:1]
+    speakers = {ln["speaker"] for ln in lines}
+    if adv in speakers:
+        return {s: (ADVISOR if s == adv else CUSTOMER) for s in speakers}, "model: " + str(data.get("reason", ""))[:160]
+    return {}, "unknown"
+
+
 # ======================================================================= step 1
 SEGMENT_SYSTEM = """You are a senior QA analyst for a UK debt-advice company (IVA / DMP advice calls).
 You read long call transcripts and mark precisely where each stage of the advisor's script happens.
 Be accurate with line numbers. Answer with JSON only."""
 
 
-def _segment_prompt(lines, role_hint, hints, n_lines) -> str:
+def _segment_prompt(conv, hints, n_lines) -> str:
     hint_rows = []
     for n in range(1, 33):
-        h = hints.get(n)
-        if not h:
-            continue
-        span = ""
-        if h.get("line_span"):
-            span = f" audit timestamps ≈ lines {h['line_span'][0]}-{h['line_span'][1]}"
-        hint_rows.append(f"{n}. status={h.get('status')}{span}")
-    return f"""Map the 32 advisor-script stages onto this debt-advice call transcript.
+        hs = hints.get(n) or []
+        if hs:
+            hint_rows.append(f"{n}. " + "; ".join(
+                f"call {h['call_no']}: status={h['status']}" + (f", audit timestamps ~ lines {h['span'][0]}-{h['span'][1]}"
+                                                               if h.get("span") else "")
+                for h in hs))
+    calls_txt = "\n".join(
+        f"- CALL {c['call_no']} (call id {c['call_id']}): lines {c['first_line']}-{c['last_line']}, starts with {c['opening']}"
+        for c in conv["calls"] if c["included"])
+    return f"""Map the 32 advisor-script stages onto this debt-advice conversation.
 
 STAGES (in script order):
 {stage_list_text()}
 
-SPEAKERS: the transcript has two speaker letters (A, B). One is the ADVISOR, the other is the CUSTOMER.
-{role_hint}
-Note: calls often start with a short lead hand-over from another agent ("I've got a lead for you...",
-reading out the customer's details) before the customer is connected. That person is NOT the customer.
-Advisors also play pre-recorded solution explanations; those count as the advisor.
+THE CONVERSATION{" (several calls, in time order - treat them as ONE continuous conversation; a stage may be split across calls or repeated after a reconnection)" if conv["multi_call"] else ""}:
+{calls_txt}
 
-AUDIT HINTS per stage (from an automated audit of this call; time ranges converted to line numbers -
+Speakers are already labelled ADVISOR / CUSTOMER. Note: calls often start with a short lead hand-over
+from another agent ("I've got a lead for you...", reading out the customer's details) before the customer
+is connected - those lines are on the CUSTOMER channel but are NOT the customer. Advisors also play
+pre-recorded solution explanations; those count as the advisor.
+
+AUDIT HINTS per stage (from the automated audit of each call; time ranges converted to line numbers -
 useful but often too wide or partly wrong; trust the transcript content over the hints):
 {chr(10).join(hint_rows) or "none"}
 
 Return JSON:
 {{
-  "advisor_speaker": "A" or "B",
-  "customer_speaker": "A" or "B",
-  "speaker_reasoning": "one sentence",
   "non_customer_spans": [{{"start": <line>, "end": <line>, "what": "e.g. lead hand-over by opener / hold / recording"}}],
   "stages": [
-    {{"n": 1, "covered": true, "spans": [[<first line>, <last line>]], "note": "short note, e.g. 'brief', 'revisited later'"}},
+    {{"n": 1, "covered": true, "spans": [[<first line>, <last line>]], "note": "short note, e.g. 'brief', 'repeated after reconnection in call 2'"}},
     ... one object for EVERY stage 1-32 ...
   ]
 }}
 Rules: line numbers are the numbers before the first "|" (0 to {n_lines - 1}). A stage may have several spans
 if it is revisited. Spans should be tight (just the lines where that stage is discussed). If a stage
-did not happen in this call, set "covered": false and "spans": [].
+did not happen anywhere in the conversation, set "covered": false and "spans": [].
 
-TRANSCRIPT (line|time|speaker|text):
+TRANSCRIPT (line|time|speaker|text; C1/C2 = call number):
 """
 
 
-def segment_call(lines, roles_guess, role_how, audit, model, usage, log) -> dict:
+def _audit_hints(conv, prepared) -> dict[int, list[dict]]:
+    """Each included call's audit timestamps for stage n, converted to merged line numbers."""
+    hints: dict[int, list[dict]] = {}
+    for c in conv["calls"]:
+        if not c["included"]:
+            continue
+        p = prepared[c["call_id"]]
+        offset = c["first_line"]
+        for n, a in p["audit"].items():
+            idx = lines_in_seconds(p["lines"], a.get("ranges") or [])
+            hints.setdefault(n, []).append({
+                "call_no": c["call_no"], "status": a.get("status"),
+                "span": [min(idx) + offset, max(idx) + offset] if idx else None,
+            })
+    return hints
+
+
+def segment_conversation(conv, prepared, model, usage, log) -> dict:
+    lines = conv["lines"]
     n = len(lines)
-    hints = {}
-    for k, a in audit.items():
-        idx = lines_in_seconds(lines, a.get("ranges") or [])
-        hints[k] = {"status": a.get("status"), "line_span": [min(idx), max(idx)] if idx else None}
-    if roles_guess:
-        adv = [s for s, r in roles_guess.items() if r == ADVISOR]
-        role_hint = (f"Hint from audit evidence ({role_how}): speaker {adv[0]} is probably the ADVISOR. "
-                     f"Verify from the content.") if adv else ""
-    else:
-        role_hint = "Work out who is who from the content."
-    body = render(lines)
+    hints = _audit_hints(conv, prepared)
+    body = render_conversation(lines)
     if len(body) > MAX_SEGMENT_CHARS:
-        log(f"    transcript very long ({len(body):,} chars) - trimming for segmentation")
+        log(f"    conversation very long ({len(body):,} chars) - trimming for stage mapping")
         body = body[:MAX_SEGMENT_CHARS]
-    prompt = _segment_prompt(lines, role_hint, hints, n) + body
-    data = llm.chat_json(model, SEGMENT_SYSTEM, prompt, usage, effort="low")
+    data = llm.chat_json(model, SEGMENT_SYSTEM, _segment_prompt(conv, hints, n) + body, usage, effort="low")
 
     stages = {}
     for st in data.get("stages") or []:
@@ -151,72 +189,63 @@ def segment_call(lines, roles_guess, role_how, audit, model, usage, log) -> dict
             a, b = max(0, min(a, b)), min(n - 1, max(a, b))
             if a <= b:
                 spans.append([a, b])
-        stages[k] = {"covered": bool(st.get("covered")) and bool(spans), "spans": spans,
+        stages[k] = {"covered": bool(st.get("covered")) and bool(spans), "spans": sorted(spans),
                      "note": st.get("note") or "", "source": "llm"}
     # Stages the model left out: fall back to tight audit hints.
     for k in range(1, 33):
         if k in stages:
             continue
-        h = hints.get(k) or {}
-        sp = h.get("line_span")
-        if sp and sp[1] - sp[0] <= 150 and (audit.get(k, {}).get("status") or "").lower() not in ("omitted", "n/a"):
-            stages[k] = {"covered": True, "spans": [sp], "note": "from audit timestamps", "source": "audit"}
-        else:
-            stages[k] = {"covered": False, "spans": [], "note": "", "source": "none"}
-
-    adv = str(data.get("advisor_speaker") or "").strip().upper()[:1]
-    speakers = {ln["speaker"] for ln in lines}
-    if roles_guess and len(set(roles_guess.values())) == 2:
-        roles, how = roles_guess, role_how
-        if adv and roles_guess.get(adv) != ADVISOR:
-            log(f"    note: model thought speaker {adv} is the advisor; keeping the audit evidence ({role_how})")
-    elif adv in speakers:
-        roles = {s: (ADVISOR if s == adv else CUSTOMER) for s in speakers}
-        how = "model: " + str(data.get("speaker_reasoning") or "")[:200]
-    else:
-        roles = {s: f"SPEAKER_{s}" for s in speakers}
-        how = "unknown"
+        spans = [h["span"] for h in hints.get(k, []) if h.get("span") and h["span"][1] - h["span"][0] <= 150
+                 and (h.get("status") or "").lower() not in ("omitted", "n/a")]
+        stages[k] = ({"covered": True, "spans": spans, "note": "from audit timestamps", "source": "audit"}
+                     if spans else {"covered": False, "spans": [], "note": "", "source": "none"})
     non_customer = []
     for sp in data.get("non_customer_spans") or []:
         try:
             non_customer.append({"start": int(sp["start"]), "end": int(sp["end"]), "what": str(sp.get("what", ""))})
         except (KeyError, TypeError, ValueError):
             pass
-    return {"roles": roles, "roles_how": how, "stages": stages, "non_customer_spans": non_customer}
+    return {"stages": stages, "non_customer_spans": non_customer}
 
 
 # ======================================================================= step 2
 STAGE_SYSTEM = """You are an expert in UK debt-advice call quality and customer behaviour.
-You study one stage of a real advisor-customer call and describe, precisely and with evidence,
+You study one stage of a real advisor-customer conversation and describe, precisely and with evidence,
 how the advisor handled it and how the CUSTOMER behaved, so a training simulator can reproduce
 this exact customer. Quote the customer verbatim. Never invent facts. Answer with JSON only."""
 
 
-def _stage_prompt(stage, audit_entry, excerpt, call_info, notes) -> str:
-    audit_txt = "No audit result for this stage."
-    if audit_entry:
-        subs = "\n".join(f"  - [{s['status']}] {s['question']}" for s in audit_entry.get("sub_questions") or [])
-        audit_txt = (f"Audit status: {audit_entry.get('status')} "
-                     f"(score {audit_entry.get('score')}/{audit_entry.get('max_score')})\n"
-                     f"Audit question: {audit_entry.get('question', '')[:600]}\n"
-                     f"Sub-questions:\n{subs or '  none'}\n"
-                     f"Auditor reasoning (may be about the whole call):\n{audit_entry.get('reasoning', '')}")
+def _audit_text(audits: list[dict]) -> str:
+    if not audits:
+        return "No audit result for this stage."
+    out = []
+    for a in audits:
+        subs = "\n".join(f"  - [{s['status']}] {s['question']}" for s in a.get("sub_questions") or [])
+        out.append(f"[Audit of call {a['call_id']} - {a.get('audit_state')}]\n"
+                   f"Status: {a.get('status')} (score {a.get('score')}/{a.get('max_score')})\n"
+                   f"Question: {(a.get('question') or '')[:600]}\n"
+                   f"Sub-questions:\n{subs or '  none'}\n"
+                   f"Auditor reasoning (may be about the whole call):\n{(a.get('reasoning') or '')[:1500]}")
+    return "\n\n".join(out)
+
+
+def _stage_prompt(stage, audits, excerpt, conv_info, notes) -> str:
     return f"""STAGE {stage['n']}: {stage['name']}
 What this stage is: {stage['desc']}
 
-CALL: {call_info}
+CONVERSATION: {conv_info}
 {notes}
 
 AUDIT FOR THIS STAGE:
-{audit_txt}
+{_audit_text(audits)}
 
-TRANSCRIPT EXCERPT FOR THIS STAGE (line|time|speaker|text):
+TRANSCRIPT EXCERPT FOR THIS STAGE (line|time|speaker|text; C1/C2 = call number):
 {excerpt}
 
 Return JSON:
 {{
   "happened": true/false,
-  "summary": "2-3 sentences: what happened in this stage",
+  "summary": "2-3 sentences: what happened in this stage (say if it was split across calls or repeated)",
   "advisor": {{
     "approach": "how the advisor ran this stage",
     "questions_asked": ["key questions/statements, close to verbatim"],
@@ -243,7 +272,7 @@ Return JSON:
 }}"""
 
 
-def analyse_stage(stage, audit_entry, lines, roles, spans, call_info, model, usage) -> dict:
+def analyse_stage(stage, audits, lines, spans, conv_info, model, usage) -> dict:
     idx: list[int] = []
     for a, b in spans:
         idx += list(range(max(0, a - 2), min(len(lines), b + 3)))
@@ -253,8 +282,8 @@ def analyse_stage(stage, audit_entry, lines, roles, spans, call_info, model, usa
         half = MAX_STAGE_LINES // 2
         idx = idx[:half] + idx[-half:]
         notes = "(Excerpt is long; the middle part was left out.)"
-    excerpt = render(lines, roles, idx)
-    return llm.chat_json(model, STAGE_SYSTEM, _stage_prompt(stage, audit_entry, excerpt, call_info, notes),
+    excerpt = render_conversation(lines, idx)
+    return llm.chat_json(model, STAGE_SYSTEM, _stage_prompt(stage, audits, excerpt, conv_info, notes),
                          usage, effort="low")
 
 
@@ -330,7 +359,7 @@ def condense_cat(cat: dict | None, anonymise: bool) -> dict:
     return out
 
 
-def _persona_prompt(ref, calls, stage_digest, cat_digest, crm, anonymise) -> str:
+def _persona_prompt(ref, calls, stage_digest, cat_digest, crm, anonymise, deep_txt="not available") -> str:
     identity_rule = (
         "ANONYMISE: invent a realistic fictional UK name (same gender and similar age/background), date of "
         "birth (same age within 2 years), address, postcode (same region) and email at example.com. Never use "
@@ -344,6 +373,10 @@ def _persona_prompt(ref, calls, stage_digest, cat_digest, crm, anonymise) -> str
 {identity_rule}
 
 CALLS: {json.dumps(calls, ensure_ascii=False)}
+
+IN-DEPTH CUSTOMER PROFILE (personality, communication, emotions, understanding, attitudes, vulnerability -
+written by a behavioural analyst from the full conversation; the persona must embody all of this):
+{deep_txt}
 
 STAGE-BY-STAGE EVIDENCE FROM THE REAL CALLS (advisor handling + customer behaviour + facts):
 {stage_digest}
@@ -375,7 +408,25 @@ Return JSON:
     "additional_debts": {{ one key per category that applies, from: {", ".join(ADDITIONAL_DEBT_KEYS)} -> "Yes/No, detail" }},
     "consent_to_recording": true/false,
     "consent_to_note_vulnerability": true/false,
-    "behavior_guide": "Several paragraphs, written like the examples below: background, how they speak, pace of disclosure, emotional triggers, resistance, typical phrases. Must reflect the real customer."
+    "backstory": "3-5 sentences: who you are and how you got here, first person",
+    "personality_traits": "2-4 sentences describing your personality (from the in-depth profile)",
+    "communication_style": "2-4 sentences: pace, how much you say, vocabulary, register, regional markers",
+    "speech_patterns": "fillers and habits, e.g. 'um', 'you know', repeating 'I, I', calling the advisor 'love'",
+    "signature_phrases": "5-10 verbatim phrases you typically use, separated by ' / '",
+    "emotional_triggers": "what upsets / embarrasses / reassures you and how you react",
+    "coping_style": "how you cope when stressed on the call (apologising, joking, going quiet...)",
+    "stress_signals": "what you sound like when you are struggling",
+    "understanding_level": "how well you follow explanations, numbers and jargon; when you need repetition",
+    "decision_style": "how you make decisions (defer to the advisor, need time, ask family...)",
+    "attitude_to_debt": "shame, responsibility, motivation",
+    "goals": "what you want out of this call and the solution",
+    "fears": "what you are afraid of",
+    "red_lines": "what you will not accept",
+    "trust_builders": "what makes you open up and trust the advisor",
+    "trust_breakers": "what makes you close down or lose trust",
+    "solution_preferences": "your reactions to each debt solution, in your words",
+    "key_people": "the people in your life who matter to this story, by role",
+    "behavior_guide": "A comprehensive guide in clearly headed sections (see FORMAT RULES). Must reflect the real customer."
   }},
   "stage_behaviour": [
     {{"n": 1, "name": "DPA", "how_customer_behaves": "2-4 sentences, second person, concrete (what you say, how, how long)", "key_lines": ["typical things to say"]}},
@@ -389,39 +440,43 @@ just peace'... Pace of disclosure: slow at first (short answers), then more deta
 advisor... Typical speech: hesitant, grammatically simple, honest. Uses 'sort of', 'I mean'."
 
 FORMAT RULES (the simulator reads these fields as plain text):
-- Every profile field is a plain-English STRING of 1-3 sentences, written the way the customer would say it
+- Be detailed, descriptive and specific - this persona must let the simulator BE this customer. Prefer the
+  customer's real words and concrete detail over generic descriptions.
+- Every profile field is a plain-English STRING (2-5 sentences where there is enough detail), written the way the customer would say it
   ("about 9,600 pounds in total, the verified figure is 8,927 pounds"). NEVER an object, list or JSON -
   except "creditors" (list of strings), "additional_debts" (object of strings) and the two consent booleans.
 - date_of_birth like "19 August 1992". gender is "female" or "male".
 - All money as e.g. "1,250 pounds". Use the customer's own words where possible. Facts must be consistent
   across fields. Where the real call and the documents disagree, say what the customer SAID on the call
   (that is how the simulated customer answers) and mention the verified figure in brackets.
-- behavior_guide: 4-7 focused paragraphs, at most about 4,000 characters. Do NOT repeat the stage-by-stage
-  detail there - that goes in stage_behaviour.
-- stage_behaviour: each "how_customer_behaves" is at most 3 sentences; up to 3 key_lines."""
+- behavior_guide: comprehensive, about 5,000-8,000 characters, in these headed sections (plain text headings
+  in capitals): WHO YOU ARE / YOUR PERSONALITY / HOW YOU SPEAK / HOW YOU FEEL AND WHAT TRIGGERS YOU /
+  HOW YOU UNDERSTAND AND DECIDE / MONEY, DEBT AND WHAT YOU WANT / TRUST AND THE ADVISOR / PACE OF DISCLOSURE.
+  Second person or third person, concrete, with real example lines. Do NOT repeat the stage-by-stage detail
+  there - that goes in stage_behaviour.
+- stage_behaviour: each "how_customer_behaves" is 2-4 concrete sentences; up to 4 key_lines (verbatim where possible)."""
 
 
 def stage_digest(stages_out: list[dict]) -> str:
     parts = []
     for st in stages_out:
-        analyses = [a for a in st.get("calls", []) if a.get("analysis")]
-        if not analyses:
-            parts.append(f"## {st['n']}. {st['name']}: not covered in the calls")
+        an = st.get("analysis")
+        if not an:
+            parts.append(f"## {st['n']}. {st['name']}: not covered in the conversation")
             continue
-        for a in analyses:
-            an = a["analysis"]
-            c = an.get("customer") or {}
-            parts.append(
-                f"## {st['n']}. {st['name']} (call {a['call_id']}, audit: {a.get('audit_status')})\n"
-                f"Summary: {an.get('summary')}\n"
-                f"Advisor: {(an.get('advisor') or {}).get('approach')}\n"
-                f"Customer: {c.get('behaviour')} | tone={c.get('tone')} | cooperation={c.get('cooperation')} | "
-                f"disclosure={c.get('disclosure_style')} | length={c.get('answer_length')}\n"
-                f"Emotions: {c.get('emotions')} Triggers: {c.get('triggers')} Resistance: {c.get('objections_or_resistance')}\n"
-                f"Speech: {c.get('speech_patterns')} Quotes: {c.get('quotes')}\n"
-                f"Facts: {an.get('facts_disclosed')}\n"
-                f"Guidance: {an.get('simulation_guidance')}"
-            )
+        c = an.get("customer") or {}
+        audits = ", ".join(f"call {a['call_id']}: {a.get('status')}" for a in st.get("audits") or []) or "none"
+        parts.append(
+            f"## {st['n']}. {st['name']} ({', '.join(st.get('time') or [])}; audit: {audits})\n"
+            f"Summary: {an.get('summary')}\n"
+            f"Advisor: {(an.get('advisor') or {}).get('approach')}\n"
+            f"Customer: {c.get('behaviour')} | tone={c.get('tone')} | cooperation={c.get('cooperation')} | "
+            f"disclosure={c.get('disclosure_style')} | length={c.get('answer_length')}\n"
+            f"Emotions: {c.get('emotions')} Triggers: {c.get('triggers')} Resistance: {c.get('objections_or_resistance')}\n"
+            f"Speech: {c.get('speech_patterns')} Quotes: {c.get('quotes')}\n"
+            f"Facts: {an.get('facts_disclosed')}\n"
+            f"Guidance: {an.get('simulation_guidance')}"
+        )
     return "\n\n".join(parts)
 
 
@@ -449,6 +504,10 @@ def _as_text(v) -> str:
 
 def _clean_profile(p: dict) -> dict:
     out = {}
+    for f in EXTRA_PROFILE_FIELDS:
+        t = _as_text(p.get(f))
+        if t:
+            out[f] = t
     for f in PROFILE_FIELDS:
         v = p.get(f)
         if f == "creditors":
@@ -488,24 +547,36 @@ def compose_behavior_guide(guide: str, overall: dict, stage_beh: list[dict]) -> 
 
 
 # ======================================================================= main
-def choose_quality(settings: dict, calls_lines: dict, cat: dict | None) -> tuple[str, str]:
+def choose_quality(settings: dict, conv: dict) -> tuple[str, str]:
     q = settings.get("quality", "auto")
     if q in ("standard", "high"):
         return q, "chosen in settings"
-    total = sum(len(v["lines"]) for v in calls_lines.values())
-    cust_text = " ".join(ln["text"] for v in calls_lines.values() for ln in v["lines"]
-                         if v["roles"].get(ln["speaker"]) != ADVISOR)
+    lines = conv["lines"]
+    cust_text = " ".join(ln["text"] for ln in lines if ln["role"] != ADVISOR)
     vuln = len(set(m.group(0).lower() for m in VULN_WORDS.finditer(cust_text)))
+    n_calls = sum(1 for c in conv["calls"] if c["included"])
     reasons = []
     if vuln >= 2:
         reasons.append(f"vulnerability signals ({vuln} kinds mentioned)")
-    if total > 2500:
-        reasons.append(f"long call ({total} lines)")
-    if len(calls_lines) > 2:
-        reasons.append(f"{len(calls_lines)} calls")
+    if len(lines) > 2500:
+        reasons.append(f"long conversation ({len(lines)} lines)")
+    if n_calls > 2:
+        reasons.append(f"{n_calls} separate calls")
     if reasons:
         return "high", "auto: " + ", ".join(reasons)
     return "standard", "auto: straightforward case"
+
+
+def _span_time(lines, a, b) -> str:
+    la, lb = lines[a], lines[b]
+    if la["call_no"] == lb["call_no"]:
+        prefix = la["t"].split(" ")[0] + " " if " " in la["t"] else ""
+        return f"{prefix}{clock(la['start'])}-{clock(lb['end'])}"
+    return f"{la['t']} - {lb['t']}"
+
+
+def _audit_state(p) -> str:
+    return p["info"].get("review_status") or "draft / not submitted (scores unreliable)"
 
 
 def build_profile(ref: str, settings: dict, log: Log, progress: Progress, anonymise: bool | None = None,
@@ -544,110 +615,143 @@ def build_profile(ref: str, settings: dict, log: Log, progress: Progress, anonym
         if not prepared:
             raise RuntimeError("None of the calls has a transcript.")
 
-        qual, qual_reason = choose_quality(settings, prepared, cat)
         m_seg = settings["model_segment"]
+        # ---- step 0: speaker roles where the audit evidence could not tell
+        for cid, p in prepared.items():
+            if len(set(p["roles"].values())) < 2:
+                log(f"  call {cid}: speaker roles not in the audit evidence - asking {m_seg}")
+                p["roles"], p["roles_how"] = resolve_roles(p["lines"], m_seg, usage)
+            log(f"  call {cid}: {len(p['lines'])} lines, speakers {p['roles']} ({str(p['roles_how'])[:70]})")
+
+        # ---- merge calls into one ordered conversation
+        conv = build_conversation(prepared, log)
+        included = [c for c in conv["calls"] if c["included"]]
+        log("Conversation: " + " -> ".join(
+            f"call {c['call_id']} ({c['lines']} lines, {c['opening']})" for c in included)
+            + f" = {len(conv['lines'])} lines")
+        store.write_json(pdir / "conversation.json", conv)
+        for old in (pdir / "calls").glob("*.json") if (pdir / "calls").exists() else []:
+            old.unlink()                       # per-call files from the old one-call-at-a-time format
+
+        qual, qual_reason = choose_quality(settings, conv)
         m_stage = settings["model_stage_high"] if qual == "high" else settings["model_stage"]
         m_persona = settings["model_persona_high"] if qual == "high" else settings["model_persona"]
         log(f"Quality: {qual} ({qual_reason}). Models: segment={m_seg}, stages={m_stage}, persona={m_persona}")
         meta.update({"quality": qual, "quality_reason": qual_reason,
-                     "models": {"segment": m_seg, "stage": m_stage, "persona": m_persona}})
+                     "models": {"segment": m_seg, "stage": m_stage, "persona": m_persona},
+                     "conversation": [{k: c.get(k) for k in ("call_id", "call_no", "included", "case_id", "lines",
+                                                             "opening", "reason", "contained_in", "containment",
+                                                             "span_in_kept")} for c in conv["calls"]]})
         store.write_json(pdir / "meta.json", meta)
 
-        reuse = persona_only and (pdir / "stages.json").exists()
+        old_stages = store.read_json(pdir / "stages.json", None)
+        reuse = persona_only and isinstance(old_stages, list) and old_stages and "calls" not in old_stages[0]
+        if persona_only and not reuse:
+            log("The saved stage analysis is from the older per-call format - running the full build instead")
+        errors: dict[int, str] = {}
         if reuse:
-            stages_out = store.read_json(pdir / "stages.json", [])
+            stages_out = old_stages
             total_steps, done = 1, 0
-            errors = {(c["call_id"], st["n"]): c["error"] for st in stages_out for c in st.get("calls", [])
-                      if c.get("error")}
+            errors = {st["n"]: st["error"] for st in stages_out if st.get("error")}
             log("Re-using the saved stage analysis - rebuilding the customer profile only")
-            meta["models"]["segment"] = (meta.get("models") or {}).get("segment", m_seg)
         else:
-            total_steps = len(prepared) + 1   # segmentation + persona; stage count added later
-            done = 0
-            progress(done, total_steps, "Segmenting calls into stages")
+            lines = conv["lines"]
+            total_steps, done = 2, 0
+            progress(done, total_steps, "Mapping the 32 stages")
 
-            # ---- step 1: segmentation
-            for cid, p in prepared.items():
-                log(f"[1/3] Call {cid}: mapping 32 stages onto {len(p['lines'])} transcript lines ...")
-                seg = segment_call(p["lines"], p["roles"], p["roles_how"], p["audit"], m_seg, usage, log)
-                p["roles"], p["roles_how"], p["seg"] = seg["roles"], seg["roles_how"], seg
-                covered = sum(1 for s in seg["stages"].values() if s["covered"])
-                log(f"    speakers: {seg['roles']} ({seg['roles_how'][:80]}); {covered}/32 stages found")
-                store.write_json(pdir / "calls" / f"{cid}.json", {
-                    "call_id": cid, "info": p["info"], "roles": seg["roles"], "roles_how": seg["roles_how"],
-                    "non_customer_spans": seg["non_customer_spans"],
-                    "stages": {str(k): v for k, v in sorted(seg["stages"].items())},
-                    "lines": p["lines"],
-                })
-                done += 1
-                progress(done, total_steps, f"Segmented call {cid}")
+            # ---- step 1: segmentation over the whole conversation
+            log(f"[1/4] Mapping 32 stages onto the conversation ({len(lines)} lines) ...")
+            seg = segment_conversation(conv, prepared, m_seg, usage, log)
+            covered = sum(1 for s in seg["stages"].values() if s["covered"])
+            log(f"    {covered}/32 stages found")
+            conv["stages"] = {str(k): v for k, v in sorted(seg["stages"].items())}
+            conv["non_customer_spans"] = seg["non_customer_spans"]
+            store.write_json(pdir / "conversation.json", conv)
+            done += 1
+            progress(done, total_steps, "Stages mapped")
 
-            # ---- step 2: stage analysis
-            tasks = []
-            for cid, p in prepared.items():
-                info = p["info"]
-                call_info = (f"call {cid} on {str(info.get('call_date'))[:10]}, advisor {info.get('advisor')}, "
-                             f"chosen solution {info.get('chosen_solution')}, audit score "
-                             f"{(info.get('totals') or {}).get('score')}/{(info.get('totals') or {}).get('max')}")
-                for st in STAGES:
-                    s = p["seg"]["stages"].get(st["n"]) or {}
-                    if s.get("covered") and s.get("spans"):
-                        tasks.append((cid, st, s["spans"], call_info))
+            # ---- step 2: one analysis per stage, across all calls
+            conv_info = ("; ".join(
+                f"call {c['call_no']} = call id {c['call_id']} on {str(prepared[c['call_id']]['info'].get('call_date'))[:10]}"
+                f" ({c['opening']}, advisor {prepared[c['call_id']]['info'].get('advisor')})" for c in included)
+                + f"; chosen solution {included[-1] and prepared[included[-1]['call_id']]['info'].get('chosen_solution')}")
+            audits_by_stage: dict[int, list[dict]] = {}
+            for c in conv["calls"]:
+                p = prepared[c["call_id"]]
+                for n, a in p["audit"].items():
+                    audits_by_stage.setdefault(n, []).append({
+                        "call_id": c["call_id"], "included": c["included"], "audit_state": _audit_state(p),
+                        "status": a.get("status"), "score": a.get("score"), "max_score": a.get("max_score"),
+                        "question": a.get("question"), "reasoning": a.get("reasoning"),
+                        "sub_questions": a.get("sub_questions")})
+            tasks = [(st, seg["stages"][st["n"]]["spans"]) for st in STAGES
+                     if seg["stages"].get(st["n"], {}).get("covered")]
             total_steps += len(tasks)
-            log(f"[2/3] Analysing {len(tasks)} stage excerpts with {m_stage} ...")
+            log(f"[2/4] Analysing {len(tasks)} stages with {m_stage} ...")
             progress(done, total_steps, "Analysing stages")
-            results: dict[tuple[int, int], dict] = {}
-            errors: dict[tuple[int, int], str] = {}
+            results: dict[int, dict] = {}
             workers = max(1, int(settings.get("parallel_stage_calls", 4)))
+
+            def stage_audits(n):
+                aud = audits_by_stage.get(n, [])
+                inc = [a for a in aud if a["included"]]
+                return inc or aud
+
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(analyse_stage, st, prepared[cid]["audit"].get(st["n"]), prepared[cid]["lines"],
-                                  prepared[cid]["roles"], spans, call_info, m_stage, usage): (cid, st["n"])
-                        for cid, st, spans, call_info in tasks}
+                futs = {ex.submit(analyse_stage, st, stage_audits(st["n"]), lines, spans, conv_info,
+                                  m_stage, usage): st["n"] for st, spans in tasks}
                 for f in as_completed(futs):
-                    key = futs[f]
+                    n = futs[f]
                     try:
-                        results[key] = f.result()
+                        results[n] = f.result()
                     except Exception as exc:  # noqa: BLE001
-                        errors[key] = str(exc)[:300]
-                        log(f"    stage {key[1]} (call {key[0]}) failed: {errors[key]}")
+                        errors[n] = str(exc)[:300]
+                        log(f"    stage {n} failed: {errors[n]}")
                     done += 1
-                    progress(done, total_steps, f"Stage {key[1]} - {STAGE_BY_N[key[1]]['name']} (call {key[0]})")
+                    progress(done, total_steps, f"Stage {n} - {STAGE_BY_N[n]['name']}")
 
             stages_out = []
             for st in STAGES:
-                entry = {"n": st["n"], "key": st["key"], "name": st["name"], "group": st["group"], "calls": []}
-                for cid, p in prepared.items():
-                    s = p["seg"]["stages"].get(st["n"]) or {}
-                    a = p["audit"].get(st["n"]) or {}
-                    if not s.get("covered") and not a:
-                        continue
-                    entry["calls"].append({
-                        "call_id": cid,
-                        "covered": bool(s.get("covered")),
-                        "spans": s.get("spans") or [],
-                        "time": [clock(p["lines"][sp[0]]["start"]) + "-" + clock(p["lines"][sp[1]]["end"])
-                                 for sp in s.get("spans") or []],
-                        "segment_note": s.get("note"),
-                        "audit_status": a.get("status"),
-                        "audit_score": [a.get("score"), a.get("max_score")] if a else None,
-                        "audit_question": a.get("question"),
-                        "audit_reasoning": a.get("reasoning"),
-                        "audit_sub_questions": a.get("sub_questions"),
-                        "analysis": results.get((cid, st["n"])),
-                        "error": errors.get((cid, st["n"])),
-                    })
-                stages_out.append(entry)
+                s = seg["stages"].get(st["n"]) or {}
+                spans = s.get("spans") or []
+                stages_out.append({
+                    "n": st["n"], "key": st["key"], "name": st["name"], "group": st["group"],
+                    "covered": bool(s.get("covered")), "spans": spans,
+                    "time": [_span_time(lines, a, b) for a, b in spans],
+                    "call_nos": sorted({lines[i]["call_no"] for a, b in spans for i in (a, b)}),
+                    "segment_note": s.get("note"),
+                    "audits": [{k: v for k, v in a.items()} for a in audits_by_stage.get(st["n"], [])],
+                    "analysis": results.get(st["n"]),
+                    "error": errors.get(st["n"]),
+                })
             store.write_json(pdir / "stages.json", stages_out)
 
-        # ---- step 3: persona
-        log(f"[3/3] Building the customer profile with {m_persona} ...")
-        calls_brief = [{"call_id": cid, "date": str(p["info"].get("call_date"))[:10],
-                        "advisor": p["info"].get("advisor"), "chosen_solution": p["info"].get("chosen_solution"),
-                        "audit": p["info"].get("totals"),
-                        "audit_state": p["info"].get("review_status") or "draft / not submitted (scores unreliable)",
-                        "transcript_lines": len(p["lines"])} for cid, p in prepared.items()]
-        crm = [c for p in prepared.values() for c in p["crm"]]
-        prompt = _persona_prompt(ref, calls_brief, stage_digest(stages_out), condense_cat(cat, anonymise), crm, anonymise)
+        # ---- step 3: in-depth customer profile from the whole conversation
+        total_steps += 1
+        cat_digest = condense_cat(cat, anonymise)
+        digest = stage_digest(stages_out)
+        log(f"[3/4] Writing the in-depth customer profile (personality, communication, emotions, "
+            f"understanding, attitudes, vulnerability) with {m_persona} ...")
+        progress(done, total_steps, "In-depth customer profile")
+        deep = build_deep_profile(ref, conv, digest, cat_digest, anonymise, m_persona, usage)
+        store.write_json(pdir / "deep_profile.json", deep)
+        done += 1
+        progress(done, total_steps, "In-depth profile written")
+
+        # ---- step 4: persona for the AI Call Agent
+        log(f"[4/4] Building the AI Call Agent persona with {m_persona} ...")
+        calls_brief = []
+        for c in conv["calls"]:
+            p = prepared[c["call_id"]]
+            calls_brief.append({
+                "call_id": c["call_id"], "order_in_conversation": c.get("call_no"),
+                "included": c["included"], "note": c.get("opening") or c.get("reason"),
+                "date": str(p["info"].get("call_date"))[:10], "advisor": p["info"].get("advisor"),
+                "chosen_solution": p["info"].get("chosen_solution"), "audit": p["info"].get("totals"),
+                "audit_state": _audit_state(p), "transcript_lines": len(p["lines"])})
+        crm = [c for cid, p in prepared.items() for c in p["crm"]
+               if any(x["call_id"] == cid and x["included"] for x in conv["calls"])]
+        prompt = _persona_prompt(ref, calls_brief, digest, cat_digest, crm, anonymise, compact_for_persona(deep))
         persona_raw = llm.chat_json(m_persona, PERSONA_SYSTEM, prompt, usage, effort="medium")
         profile = _clean_profile(persona_raw.get("profile") or {})
         stage_beh = [s for s in persona_raw.get("stage_behaviour") or [] if isinstance(s, dict)]
@@ -668,11 +772,13 @@ def build_profile(ref: str, settings: dict, log: Log, progress: Progress, anonym
             "persona": persona_row, "difficulty": persona_raw.get("difficulty"), "overall": overall,
             "stage_behaviour": stage_beh,
         })
+        meta_now = {**meta, "updated_at": _now()}
+        (pdir / "customer_profile.md").write_text(report_markdown(ref, deep, persona_row, meta_now), encoding="utf-8")
         done += 1
         progress(done, total_steps, "Profile ready")
 
         meta.update({"status": "ready", "updated_at": _now(), "created_at": meta.get("created_at") or _now(),
-                     "usage": usage.by_model, "calls": list(prepared), "stage_errors": len(errors),
+                     "usage": usage.by_model, "calls": [c["call_id"] for c in included], "stage_errors": len(errors),
                      "persona_id": persona_row["id"]})
         store.write_json(pdir / "meta.json", meta)
         log(f"Done: profile '{persona_row['label']}' ({persona_row['id']}). Tokens: {usage.by_model}")
