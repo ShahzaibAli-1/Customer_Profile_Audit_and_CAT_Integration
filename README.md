@@ -79,7 +79,41 @@ Restart the customer agent service to load it. The path can be changed in **Sett
 
 ---
 
-## 3. Command-line scripts (optional)
+## 3. Realistic customer agent (two-way conversation)
+
+Every case with a finished profile becomes a **customer you can talk to**. The customer agent plays the real
+customer: their facts, personality, way of speaking, emotions and understanding, stage by stage. On every
+turn it is shown how the *real* customer answered the most similar thing the real advisor said, so each
+customer sounds like themselves. It also handles document requests with the customer's **real documents**
+from the CAT document vault (photo ID, bank statements, UC statement…): it says it's opening the email,
+uploads on a later turn, and never sends something it doesn't have.
+
+**In the Studio:** open a case → **Talk to customer**. You are the advisor; quick buttons insert Katie's
+usual lines (DPA, photo ID, "send links and wait", income…). Uploads appear as attachments you can open.
+
+**For the AI Call Agent (Katie, agent-to-agent):**
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start_customer_agent.ps1        # http://localhost:8020
+```
+Then in `C:\AI_Call_Agent\backend\.env` set:
+```
+CUSTOMER_AGENT_URL=http://localhost:8020
+```
+and restart Katie's backend. The customers appear on Katie's A2A page under **Real transcript personas**
+(or run `venv\Scripts\python.exe a2a_runner.py --customer <persona id or case number> --full`).
+The API is the same one Katie already uses (`/api/customers/{id}`, `/api/call`, `/api/call/{id}`,
+`DELETE /api/conversation/{id}`). Each reply also carries:
+- `actions` – e.g. `{"type": "upload", "documents": ["bank_statement"], "files": [{"file_name", "url"}]}`,
+  `will_upload_later`, `cannot_provide`
+- `stage` – the script stage (1–32) the customer thinks the call is in, and `mood`
+
+Other endpoints: `GET /api/customers/{id}/documents`, `GET /api/customers/{id}/documents/{key}` (the file an
+upload points to), `GET /api/sessions/{session_id}` (transcript + uploads), `GET /api/customer-agent/health`.
+The model is set in Studio **Settings → Customer agent** (default `gpt-6.1-terra`, low effort: replies in ~3–5 s).
+
+---
+
+## 4. Command-line scripts (optional)
 
 Fetch Audit tool calls (no audio by default):
 ```powershell
@@ -101,20 +135,21 @@ Useful options: `--refetch` (fetch again), `--limit N` (max calls), `--audio` (a
 
 ---
 
-## 4. Where data is saved
+## 5. Where data is saved
 
 | Folder | Contents |
 |---|---|
 | `audit_output/customers/<case>_<name>/call_<id>/` | `transcript.txt`, `audit_report.json/.txt`, `crm.json`, `case_record.json`, `details.json` |
 | `cat_output/cases/<case>_<name>/` | `case_export.json`, fields, tables, documents list, summary |
 | `cat_output/cases/<case>_<name>/documents/` | The downloaded documents (ID/, Income/, Bank Statements/, POD/ …) plus `documents.json` / `.csv` |
+| `customer_agent_sessions/` | Conversations with the customer agent (transcript + uploads per call) |
 | `profiles_output/<case>/` | `persona.json` (AI Call Agent format), `stages.json` (32-stage analysis), per-call stage mapping |
 
 Already-fetched calls and cases are skipped automatically.
 
 ---
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 | Problem | Fix |
 |---|---|

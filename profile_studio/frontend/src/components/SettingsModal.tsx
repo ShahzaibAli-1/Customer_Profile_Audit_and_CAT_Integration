@@ -9,6 +9,7 @@ const MODEL_FIELDS: [string, string][] = [
   ["model_stage_high", "Stage analysis – high quality"],
   ["model_persona", "Customer profile – standard"],
   ["model_persona_high", "Customer profile – high quality"],
+  ["customer_model", "Customer agent (live conversation)"],
 ];
 
 export default function SettingsModal({ onClose, health }: { onClose: () => void; health: Json }) {
@@ -70,6 +71,14 @@ export default function SettingsModal({ onClose, health }: { onClose: () => void
                     <option value="auto">Auto (high for complex / vulnerable cases)</option>
                     <option value="standard">Standard</option>
                     <option value="high">High</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="label">Customer agent reasoning effort</label>
+                  <select className="input" value={s.customer_effort || "low"} onChange={(e) => setS({ ...s, customer_effort: e.target.value })}>
+                    <option value="low">Low – fastest replies</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High – slowest</option>
                   </select>
                 </div>
                 <div>

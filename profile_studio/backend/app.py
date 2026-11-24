@@ -24,8 +24,12 @@ from pipeline import llm
 from pipeline.stages import STAGES
 from pipeline.transcript import ADVISOR, build_lines, clock, guess_roles
 
+from customer_agent.api import router as customer_agent_router  # noqa: E402  (ROOT is on sys.path via sources)
+
 app = FastAPI(title="Customer Profile Studio")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# The realistic customer agent (same API Katie uses), so the Studio's "Talk to customer" tab can chat with it.
+app.include_router(customer_agent_router)
 
 
 @app.on_event("startup")

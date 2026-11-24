@@ -1,4 +1,5 @@
-import { Bot, Download, FileText, FolderOpen, LayoutGrid, ListChecks, MessagesSquare, RefreshCw, Sparkles, UserRound } from "lucide-react";
+import { Bot, Download, FileText, FolderOpen, LayoutGrid, ListChecks, MessagesSquare, Phone, RefreshCw, Sparkles, UserRound } from "lucide-react";
+import TalkTab from "./TalkTab";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, fmtDate, fmtDay, fmtDuration, Json } from "../api";
 import { go } from "../App";
@@ -15,6 +16,7 @@ const TABS: [string, string, JSX.Element][] = [
   ["overview", "Overview", <LayoutGrid key="o" className="h-4 w-4" />],
   ["stages", "Stages (1–32)", <ListChecks key="s" className="h-4 w-4" />],
   ["profile", "Customer profile", <UserRound key="p" className="h-4 w-4" />],
+  ["talk", "Talk to customer", <Phone key="k" className="h-4 w-4" />],
   ["transcript", "Transcript", <MessagesSquare key="t" className="h-4 w-4" />],
   ["audit", "Audit", <Bot key="a" className="h-4 w-4" />],
   ["documents", "Documents", <FolderOpen key="d" className="h-4 w-4" />],
@@ -187,6 +189,7 @@ export default function CaseView({ refId, tab, refreshKey, jobs, onJobStarted, h
         {tab === "profile" && <ProfileTab refId={refId} profile={profile} onSaved={load} onBuild={() => build()} building={activeJobs.length > 0} />}
         {tab === "transcript" && <TranscriptTab refId={refId} calls={detail?.calls || []} focus={transcriptFocus} />}
         {tab === "audit" && <AuditTab refId={refId} calls={detail?.calls || []} />}
+        {tab === "talk" && <TalkTab refId={refId} hasProfile={pstatus === "ready" && Boolean(profile?.persona)} />}
         {tab === "documents" && (
           <DocumentsTab refId={refId} refreshKey={refreshKey} onFetch={fetchDocs} busy={busy || activeJobs.length > 0}
             configured={Boolean(health?.cat_docs_configured)} />

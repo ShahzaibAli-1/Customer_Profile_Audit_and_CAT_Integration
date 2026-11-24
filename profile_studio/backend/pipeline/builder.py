@@ -624,6 +624,7 @@ def build_profile(ref: str, settings: dict, log: Log, progress: Progress, anonym
             log(f"  call {cid}: {len(p['lines'])} lines, speakers {p['roles']} ({str(p['roles_how'])[:70]})")
 
         # ---- merge calls into one ordered conversation
+        prev_conv = store.read_json(pdir / "conversation.json", {}) or {}
         conv = build_conversation(prepared, log)
         included = [c for c in conv["calls"] if c["included"]]
         log("Conversation: " + " -> ".join(
@@ -652,6 +653,12 @@ def build_profile(ref: str, settings: dict, log: Log, progress: Progress, anonym
         if reuse:
             stages_out = old_stages
             total_steps, done = 1, 0
+            # Keep the stage map on the rebuilt conversation (it was saved without it just above).
+            old_conv_stages = {str(st["n"]): {"covered": st.get("covered"), "spans": st.get("spans") or [],
+                                              "note": st.get("segment_note") or ""} for st in stages_out}
+            conv["stages"] = old_conv_stages
+            conv["non_customer_spans"] = prev_conv.get("non_customer_spans") or []
+            store.write_json(pdir / "conversation.json", conv)
             errors = {st["n"]: st["error"] for st in stages_out if st.get("error")}
             log("Re-using the saved stage analysis - rebuilding the customer profile only")
         else:

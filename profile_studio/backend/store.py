@@ -29,6 +29,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "lookup_days": 60,                   # default date window when searching by case number
     "agent_personas_path": r"C:\AI_Call_Agent\customer_agent\data\personas\transcript_personas.json",
     "parallel_stage_calls": 4,
+    # The customer agent (two-way conversation): fast model, low reasoning effort keeps replies quick.
+    "customer_model": "gpt-6.1-terra",
+    "customer_effort": "low",
 }
 
 _lock = threading.Lock()

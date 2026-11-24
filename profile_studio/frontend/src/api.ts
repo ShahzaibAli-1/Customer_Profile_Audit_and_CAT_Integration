@@ -34,6 +34,13 @@ export const api = {
   docUrl: (ref: string, path: string, download = false) =>
     `/api/cases/${ref}/documents/file?path=${encodeURIComponent(path)}${download ? "&download=true" : ""}`,
   conversation: (ref: string) => req("GET", `/api/cases/${ref}/conversation`),
+  // customer agent (same API the AI Call Agent uses)
+  customer: (id: string) => req("GET", `/api/customers/${id}`),
+  customerDocs: (id: string) => req("GET", `/api/customers/${id}/documents`),
+  agentHealth: () => req("GET", "/api/customer-agent/health"),
+  startCall: (id: string, opening: string) => req("POST", "/api/call", { customer_id: id, advisor_opening: opening }),
+  say: (id: string, message: string, sessionId: string) => req("POST", `/api/call/${id}`, { message, session_id: sessionId }),
+  session: (sid: string) => req("GET", `/api/sessions/${sid}`),
   transcript: (ref: string, callId: number) => req("GET", `/api/cases/${ref}/calls/${callId}/transcript`),
   audit: (ref: string, callId: number) => req("GET", `/api/cases/${ref}/calls/${callId}/audit`),
   profile: (ref: string) => req("GET", `/api/cases/${ref}/profile`),
