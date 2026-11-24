@@ -40,7 +40,7 @@ def _contains_identity(text: str, banned: set[str]) -> bool:
 
 
 def _name_variant(word: str, name: str) -> bool:
-    """'jody' ~ 'jodie', 'jodi' ~ 'jodie': transcripts spell names however they sound."""
+    """'jon' ~ 'john', 'katy' ~ 'katie': transcripts spell names however they sound."""
     if word == name:
         return True
     if len(name) < 4 or len(word) < 3 or word[:3] != name[:3] or abs(len(word) - len(name)) > 2:
