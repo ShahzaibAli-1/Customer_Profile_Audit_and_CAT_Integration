@@ -67,33 +67,75 @@ class Persona:
         return (self.profile.get("gender") or "").lower()
 
 
-def _identity_strings(ref: str) -> set[str]:
-    """The REAL customer's identity details (to keep them out of examples for anonymised personas)."""
-    out: set[str] = set()
+NAME_FIELDS = {"full_name", "first_name", "last_name", "surname", "middle_name", "name"}
+
+
+def _identity_strings(ref: str) -> tuple[set[str], set[str]]:
+    """The REAL customer's identity, to keep it out of the examples of an anonymised persona.
+
+    Returns (name_tokens, other_tokens): names are replaced by the persona's name (with spelling
+    variants, since transcripts spell names however they sound); anything else (address, postcode,
+    phone, email, DOB) makes the example be dropped.
+    """
+    names: set[str] = set()
+    surnames: set[str] = set()
+    others: set[str] = set()
     cat = None
     for d in sorted((CAT_DIR / "cases").glob(f"{ref}_*")) if (CAT_DIR / "cases").exists() else []:
         cat = _read(d / "case_export.json")
         if cat:
             break
     for f in (cat or {}).get("fields") or []:
-        if f.get("field_id") in {"full_name", "first_name", "last_name", "middle_name", "email", "phone",
-                                 "mobile", "postcode", "address", "dob", "date_of_birth"} and f.get("value"):
-            out.add(str(f["value"]))
+        v = f.get("value")
+        if not v or f.get("section") not in ("personal_details", "partner") and f.get("field_id") not in NAME_FIELDS:
+            continue
+        if f.get("field_id") in ("surname", "last_name"):
+            surnames.add(str(v))
+        else:
+            (names if f.get("field_id") in NAME_FIELDS else others).add(str(v))
+    for app in ((cat or {}).get("case_profile") or {}).get("applicants") or []:
+        dpa = app.get("dpa") or {}
+        if dpa.get("full_name"):
+            names.add(str(dpa["full_name"]))
+        for k in ("address", "postcode", "date_of_birth"):
+            if dpa.get(k):
+                others.add(str(dpa[k]))
+        for k in ("email", "phone"):
+            if (app.get("personal") or {}).get(k):
+                others.add(str(app["personal"][k]))
     for cdir in sorted((AUDIT_DIR / "customers").glob(f"{ref}_*")) if (AUDIT_DIR / "customers").exists() else []:
         for call in cdir.glob("call_*"):
             rec = _read(call / "case_record.json", {}) or {}
             if rec.get("customer_name"):
-                out.add(str(rec["customer_name"]))
-    tokens: set[str] = set()
-    for s in out:
-        for t in re.split(r"[\s,]+", s):
-            t = t.strip().lower()
-            if len(t) >= 3 and not t.isdigit():
-                tokens.add(t)
-        compact = re.sub(r"\s+", "", s.lower())
-        if len(compact) >= 5:
-            tokens.add(compact)
-    return tokens
+                names.add(str(rec["customer_name"]))
+
+    def split(values: set[str]) -> set[str]:
+        tokens: set[str] = set()
+        for s in values:
+            for t in re.split(r"[\s,]+", s):
+                t = t.strip().lower().strip(".")
+                if len(t) >= 3 and not t.isdigit() and t not in ("miss", "mrs", "mr", "ms"):
+                    tokens.add(t)
+            compact = re.sub(r"[^a-z0-9@.]", "", s.lower())
+            if len(compact) >= 5:
+                tokens.add(compact)
+            for pc in re.findall(r"[a-z]{1,2}\d[a-z\d]?\s*\d[a-z]{2}", s.lower()):
+                tokens.add(re.sub(r"\s", "", pc))
+        return tokens
+
+    name_kinds: dict[str, str] = {}
+    for s in names:
+        words = [w.lower().strip(".") for w in re.split(r"[\s,]+", s) if w.strip()]
+        words = [w for w in words if w.isalpha() and len(w) >= 3 and w not in ("miss", "mrs", "mr", "ms")]
+        for i, w in enumerate(words):
+            kind = "first" if i == 0 else "last"
+            if name_kinds.get(w) != "first":          # a word seen as a first name anywhere stays a first name
+                name_kinds[w] = kind
+    for s in surnames:                                # the surname field is always the surname
+        for w in re.split(r"[\s,-]+", s.lower()):
+            if w.isalpha() and len(w) >= 3:
+                name_kinds[w] = "last"
+    return name_kinds, split(others)
 
 
 class PersonaStore:
@@ -117,8 +159,9 @@ class PersonaStore:
         stages = _read(pdir / "stages.json", []) or []
         stage_names = {s["n"]: s["name"] for s in stages if isinstance(s, dict) and "n" in s}
         anonymised = bool(meta.get("anonymised", True))
-        banned = _identity_strings(ref) if anonymised else set()
-        exchanges = build_exchanges(conv, banned) if conv else []
+        names, banned = _identity_strings(ref) if anonymised else ({}, set())
+        persona_name = (persona.get("profile") or {}).get("name") or persona.get("label") or ""
+        exchanges = build_exchanges(conv, banned, names, persona_name) if conv else []
         return Persona(
             id=persona["id"], ref=ref, label=persona.get("label") or persona["id"],
             segment=persona.get("segment", ""), risk=persona.get("risk", ""), stage=persona.get("stage", ""),

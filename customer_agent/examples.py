@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from difflib import SequenceMatcher
 
 STOP = set("""a an the and or but if so to of in on at for with from by is are was were be been being am i you he she
 it we they me him her us them my your his its our their this that these those there here what which who whom whose
@@ -38,7 +39,34 @@ def _contains_identity(text: str, banned: set[str]) -> bool:
     return False
 
 
-def build_exchanges(conv: dict, banned: set[str]) -> list[dict]:
+def _name_variant(word: str, name: str) -> bool:
+    """'jody' ~ 'jodie', 'jodi' ~ 'jodie': transcripts spell names however they sound."""
+    if word == name:
+        return True
+    if len(name) < 4 or len(word) < 3 or word[:3] != name[:3] or abs(len(word) - len(name)) > 2:
+        return False
+    return SequenceMatcher(None, word, name).ratio() >= 0.6
+
+
+def replace_names(text: str, real_names: dict[str, str], persona_name: str) -> str:
+    """Real names (and spelling variants) -> the persona's name. real_names: token -> 'first' | 'last'."""
+    if not real_names or not persona_name:
+        return text
+    parts = persona_name.split()
+    p_first, p_last = parts[0], (parts[-1] if len(parts) > 1 else parts[0])
+
+    def sub(m):
+        w = m.group(0)
+        for n, kind in real_names.items():
+            if _name_variant(w.lower(), n):
+                return p_first if kind == "first" else p_last
+        return w
+    return re.sub(r"[A-Za-z][A-Za-z']+", sub, text)
+
+
+def build_exchanges(conv: dict, banned: set[str], real_names: dict[str, str] | None = None,
+                    persona_name: str = "") -> list[dict]:
+    real_names = real_names or {}
     lines = conv.get("lines") or []
     stage_of: dict[int, list[int]] = {}
     for n, st in (conv.get("stages") or {}).items():
@@ -68,9 +96,10 @@ def build_exchanges(conv: dict, banned: set[str]) -> list[dict]:
         if prev["role"] != "advisor" or cur["role"] != "customer":
             continue
         stages = sorted(set(stage_of.get(cur["first"], []) + stage_of.get(prev["last"], [])))
-        if banned and 1 in stages:            # identity checks: never shown for an anonymised persona
+        if (banned or real_names) and 1 in stages:   # identity checks: never shown for an anonymised persona
             continue
-        adv, cust = prev["text"].strip(), cur["text"].strip()
+        adv = replace_names(prev["text"].strip(), real_names, persona_name)
+        cust = replace_names(cur["text"].strip(), real_names, persona_name)
         if len(cust) < 2 or _contains_identity(adv + " " + cust, banned):
             continue
         out.append({"advisor": adv[-450:], "customer": cust[:500], "stages": stages, "line": cur["first"]})
