@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Secrets - API keys and CAT sign-in. Never commit. Use .env.example as the template.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Customer data - real transcripts, audits, CRM data, IDs, bank statements and
+# personas built from them. Personal data: must never be pushed to GitHub.
+# ---------------------------------------------------------------------------
+audit_output/
+cat_output/
+profiles_output/
+output/
+*.zip
+*.mp3
+*.wav
+
+# Local app settings (model choices, local file paths)
+profile_studio/settings.json
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Frontend (Node / Vite)
+# ---------------------------------------------------------------------------
+node_modules/
+profile_studio/frontend/dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# ---------------------------------------------------------------------------
+# Editors / OS / temp
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.claude/
+*.log
+*.tmp
+*.part
+*.backup-*
+.DS_Store
+Thumbs.db
+desktop.ini
