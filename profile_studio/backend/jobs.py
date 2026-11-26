@@ -137,11 +137,16 @@ def start_fetch(refs: list[str], start: date, end: date, include_cat: bool = Tru
             summary["calls_failed"] += r["failed"]
             done += 1
             _progress(job, done, total, f"Audit call {cid}")
+        cancelled = lambda: bool(job["cancel"])  # noqa: E731
+        cat_asked = False                       # CAT has been asked something: pause before the next ask
         if include_cat:
             for ref in refs:
                 if job["cancel"]:
                     log("Cancelled.")
                     return summary
+                if cat_asked:
+                    sources.cat_pause(log, f"before CAT case {ref}", cancelled)
+                cat_asked = True
                 try:
                     summary["cat"][ref] = sources.fetch_cat_case(ref, log, refetch=refetch).get("status")
                 except Exception as exc:  # noqa: BLE001
@@ -157,9 +162,16 @@ def start_fetch(refs: list[str], start: date, end: date, include_cat: bool = Tru
                     if job["cancel"]:
                         log("Cancelled.")
                         return summary
+                    if cat_asked:
+                        sources.cat_pause(log, f"before CAT documents {ref}", cancelled)
+                        if job["cancel"]:
+                            log("Cancelled.")
+                            return summary
+                    cat_asked = True
                     _progress(job, done, total, f"Downloading CAT documents {ref}")
+                    names = [c.get("customer_name") for c in found.get(ref, []) if c.get("customer_name")]
                     try:
-                        r = sources.fetch_cat_documents(ref, log, refetch=refetch)
+                        r = sources.fetch_cat_documents(ref, log, refetch=refetch, names=names)
                         summary["documents"][ref] = r.get("status")
                     except Exception as exc:  # noqa: BLE001
                         summary["documents"][ref] = "failed"
@@ -168,6 +180,13 @@ def start_fetch(refs: list[str], start: date, end: date, include_cat: bool = Tru
                     _progress(job, done, total, f"CAT documents {ref}")
         log(f"Fetched {len(summary['calls_fetched'])} call(s), {len(summary['calls_skipped'])} already had, "
             f"{len(summary['calls_failed'])} failed.")
+        if summary["documents"]:
+            by = {}
+            for ref, status in summary["documents"].items():
+                by.setdefault(status, []).append(ref)
+            words = {"fetched": "downloaded", "skipped": "unchanged", "not_found": "not found", "failed": "failed"}
+            log("CAT documents: " + ", ".join(f"{len(v)} {words.get(k, k)}" + (f" ({', '.join(v)})" if k in ("not_found", "failed") else "")
+                                             for k, v in by.items()) + ".")
         if build_profile:
             for ref in refs:
                 if store.call_dirs(ref):

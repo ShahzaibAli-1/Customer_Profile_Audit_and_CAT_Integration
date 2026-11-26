@@ -11,8 +11,10 @@ day is only listed again if it is recent (calls may still be arriving).
 from __future__ import annotations
 
 import os
+import random
 import sys
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
@@ -227,14 +229,31 @@ def cat_docs_configured() -> bool:
     return bool(os.getenv("CAT_URL") and (os.getenv("CAT_USERNAME") or os.getenv("CAT_EMAIL")) and os.getenv("CAT_PASSWORD"))
 
 
-def fetch_cat_documents(ref: str, log: Log = print, refetch: bool = False) -> dict:
+def cat_pause(log: Log = print, why: str = "", cancelled: Callable[[], bool] | None = None) -> None:
+    """Wait 3-5 s (CAT_CASE_GAP_S in .env) between steps that hit CAT, so it is never asked
+    back-to-back. Waits in small steps so a cancelled job stops promptly."""
+    _env()
+    lo, hi = docs_mod.parse_gap(os.getenv("CAT_CASE_GAP_S"), (3.0, 5.0))
+    secs = round(random.uniform(lo, hi), 1)
+    if secs <= 0:
+        return
+    if why:
+        log(f"  … waiting {secs:g}s {why}")
+    end = time.monotonic() + secs
+    while (left := end - time.monotonic()) > 0:
+        if cancelled and cancelled():
+            return
+        time.sleep(min(0.5, left))
+
+
+def fetch_cat_documents(ref: str, log: Log = print, refetch: bool = False, names: list[str] | None = None) -> dict:
     """Sign in to the CAT web app and 'Download all' documents for the case."""
     global _docs_client
     with _docs_lock:
         if _docs_client is None:
             _docs_client = docs_mod.client_from_env()
         try:
-            return docs_mod.fetch_documents(_docs_client, ref, CAT_DIR, refetch, log)
+            return docs_mod.fetch_documents(_docs_client, ref, CAT_DIR, refetch, log, names=names)
         except docs_mod.CatDocumentsError:
             _docs_client = None          # drop the session so the next try signs in fresh
             raise
