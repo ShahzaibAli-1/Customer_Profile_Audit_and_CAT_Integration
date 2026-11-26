@@ -158,7 +158,7 @@ class PersonaStore:
         conv = _read(pdir / "conversation.json")
         stages = _read(pdir / "stages.json", []) or []
         stage_names = {s["n"]: s["name"] for s in stages if isinstance(s, dict) and "n" in s}
-        anonymised = bool(meta.get("anonymised", True))
+        anonymised = bool(meta.get("anonymised", False))
         names, banned = _identity_strings(ref) if anonymised else ({}, set())
         persona_name = (persona.get("profile") or {}).get("name") or persona.get("label") or ""
         exchanges = build_exchanges(conv, banned, names, persona_name) if conv else []

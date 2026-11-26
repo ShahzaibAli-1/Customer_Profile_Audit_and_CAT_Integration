@@ -38,7 +38,7 @@ function Options({ opts, setOpts, openai }: { opts: Opts; setOpts: (o: Opts) => 
 
 export default function FetchPanel({ health, onJobStarted }: { health: Json; onJobStarted: (j: Json) => void }) {
   const [mode, setMode] = useState<"ids" | "browse">("ids");
-  const [opts, setOpts] = useState<Opts>({ include_cat: true, include_documents: true, build_profile: true, refetch: false, quality: "auto", anonymise: true });
+  const [opts, setOpts] = useState<Opts>({ include_cat: true, include_documents: true, build_profile: true, refetch: false, quality: "auto", anonymise: false });
   const [settings, setSettings] = useState<Json>(null);
   const [text, setText] = useState("");
   const [start, setStart] = useState(daysAgo(60));

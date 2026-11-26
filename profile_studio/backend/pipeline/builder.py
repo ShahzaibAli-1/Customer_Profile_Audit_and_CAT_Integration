@@ -584,7 +584,7 @@ def build_profile(ref: str, settings: dict, log: Log, progress: Progress, anonym
     ref = store.clean_ref(ref)
     if quality:
         settings = {**settings, "quality": quality}
-    anonymise = settings.get("anonymise", True) if anonymise is None else anonymise
+    anonymise = settings.get("anonymise", False) if anonymise is None else anonymise
     pdir = store.profile_dir(ref)
     pdir.mkdir(parents=True, exist_ok=True)
     meta = store.read_json(pdir / "meta.json", {}) or {}

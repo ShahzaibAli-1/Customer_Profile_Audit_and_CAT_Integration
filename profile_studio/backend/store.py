@@ -25,7 +25,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "model_persona": "gpt-6.1-sol",        # final customer profile (standard)
     "model_persona_high": "gpt-6.1-sol",   # final customer profile (complex / vulnerable cases)
     "quality": "auto",                   # auto | standard | high
-    "anonymise": True,                   # replace real identity details in the persona
+    "anonymise": False,                  # True: invent a fictional name, DOB, address and email for the persona
     "lookup_days": 60,                   # default date window when searching by case number
     "agent_personas_path": r"C:\AI_Call_Agent\customer_agent\data\personas\transcript_personas.json",
     "parallel_stage_calls": 4,
